@@ -1,0 +1,3 @@
+[submodule "car-logos-dataset"]
+	path = car-logos-dataset
+	url = https://github.com/filippofilip95/car-logos-dataset.git
