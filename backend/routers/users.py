@@ -17,8 +17,8 @@ Security = HTTPBearer()
 
 ACCESS_COOKIE_NAME = "access_token"
 REFRESH_COOKIE_NAME = "refresh_token"
-COOKIE_SECURE = False
-COOKIE_SAMESITE = "lax"
+COOKIE_SECURE = True
+COOKIE_SAMESITE = "none"
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def register_user(
