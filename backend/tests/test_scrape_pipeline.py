@@ -206,8 +206,10 @@ class DatabaseTests(unittest.TestCase):
             run.checkpoint_page(1, [1, 3], finished=True)
             runtime.prepare_staging(run)
         with runtime.stage_session("details") as run:
-            self.assertEqual(run.pending_ids(), [3])
-            details.save_batch(run.connection, [self.car(3)], run)
+            self.assertEqual(run.pending_ids(), [1, 3])
+            refreshed = self.car(1)
+            refreshed.update(price=3500, mileage=110000, seller_username="updated-seller")
+            details.save_batch(run.connection, [refreshed, self.car(3)], run)
             with run.connection.cursor() as cur:
                 run.finish(cur,"details")
             run.connection.commit()
@@ -219,20 +221,26 @@ class DatabaseTests(unittest.TestCase):
 
     def test_publication_keeps_scores_history_metadata_and_favourites(self):
         self.prepare_batch()
-        # Scores updated during a scrape must supersede the staging copy.
+        # Scores updated during a scrape must be retained alongside refreshed details.
         self.conn.execute('UPDATE listings SET score=77 WHERE id=1')
         self.conn.execute('UPDATE listings_cleaned SET "Score"=78 WHERE id=1')
         self.conn.commit()
         with runtime.stage_session("publish") as run:
             publisher.publish(run)
         rows = self.conn.execute('SELECT id,"Score",app_note,vin FROM listings_cleaned ORDER BY id').fetchall()
-        self.assertEqual(rows[0], (1, 78, "keep me", None))
+        self.assertEqual(rows[0], (1, 78, "keep me", "VIN-1"))
         self.assertEqual(rows[1], (3, None, None, "VIN-3"))
         self.assertEqual(self.conn.execute('SELECT "Score" FROM listings_cleaned_alltime WHERE id=2').fetchone()[0],42.5)
         self.assertEqual(self.conn.execute('SELECT score FROM listings_alltime WHERE id=2').fetchone()[0],20)
         self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM favourite_listings').fetchone()[0],1)
         self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM listings_cleaned_alltime').fetchone()[0],4)
         self.assertEqual(self.conn.execute('SELECT score FROM listings WHERE id=1').fetchone()[0],77)
+        self.assertEqual(self.conn.execute(
+            "SELECT price_eur,mileage,seller_username FROM listings_cleaned WHERE id=1"
+        ).fetchone(), (3500, 110000, "updated-seller"))
+        self.assertEqual(self.conn.execute(
+            "SELECT price,seller_username FROM listings_alltime WHERE id=1 AND snapshot_phase='outgoing'"
+        ).fetchone(), (3000, None))
         self.assertEqual(self.conn.execute("SELECT vin,seller_username,image_url FROM listings_cleaned_alltime WHERE id=3").fetchone(),
                          ("VIN-3", "seller", "https://example.test/car.jpg"))
         self.conn.commit()
@@ -271,7 +279,7 @@ class DatabaseTests(unittest.TestCase):
             run.checkpoint_page(2,[3,4],finished=True)
             runtime.prepare_staging(run)
         with runtime.stage_session("details") as run:
-            details.save_batch(run.connection,[self.car(3)],run)
+            details.save_batch(run.connection,[self.car(1),self.car(3)],run)
             details.record_failure(run.connection,run,4,{"kind":"timeout","error":"retry"})
         with runtime.stage_session("details") as run:
             self.assertEqual(run.pending_ids(),[4])
@@ -318,7 +326,9 @@ class DatabaseTests(unittest.TestCase):
         with runtime.stage_session("discover") as run:
             run.checkpoint_page(1, [1,3], finished=True)
             runtime.prepare_staging(run)
-            details.save_batch(run.connection, [self.car(3)], run)
+            self.assertEqual(run.pending_ids(), [1,3])
+            self.assertEqual(run.connection.execute("SELECT COUNT(*) FROM listings_temp").fetchone()[0], 0)
+            details.save_batch(run.connection, [self.car(1), self.car(3)], run)
             runtime.prepare_staging(run)
             self.assertEqual(run.pending_ids(), [])
         self.assertEqual(self.conn.execute("SELECT vin FROM listings_temp WHERE id=3").fetchone()[0], "VIN-3")
@@ -360,6 +370,7 @@ class DatabaseTests(unittest.TestCase):
             run.checkpoint_page(1, [1,2], finished=True)
             runtime.prepare_staging(run)
         with runtime.stage_session("details") as run:
+            details.save_batch(run.connection, [self.car(1), self.car(2)], run)
             with run.connection.cursor() as cur:
                 run.finish(cur, "details")
             run.connection.commit()
@@ -383,6 +394,60 @@ class DatabaseTests(unittest.TestCase):
                 run.finish(cur, "details")
             run.connection.commit()
         cleaner.main()
+
+    def test_cleaner_excludes_named_sellers_but_retains_other_accounts_and_raw_rows(self):
+        blocked = list(cleaner.EXCLUDED_SELLER_USERNAMES)
+        rows = []
+        for listing_id, username in enumerate(blocked, start=3):
+            row = self.car(listing_id)
+            row["seller_username"] = f"  {username.upper()}  "
+            rows.append(row)
+        allowed_id = len(blocked) + 3
+        missing_id = allowed_id + 1
+        allowed = self.car(allowed_id)
+        allowed["seller_username"] = "Sauto-stock-extern-ltd"
+        missing = self.car(missing_id)
+        missing["seller_username"] = None
+        rows.extend((allowed, missing))
+
+        self.clean_detail_rows(rows)
+
+        self.assertEqual(
+            self.conn.execute("SELECT id FROM listings_cleaned_temp ORDER BY id").fetchall(),
+            [(allowed_id,), (missing_id,)],
+        )
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM listings_temp").fetchone()[0], len(rows))
+        self.assertEqual(
+            self.conn.execute("SELECT id FROM listings_cleaned ORDER BY id").fetchall(),
+            [(1,), (2,)],
+        )
+
+    def test_cleaner_excludes_selected_sellers_only_below_corrected_mileage_threshold(self):
+        rows = []
+        for listing_id, username in enumerate(cleaner.LOW_MILEAGE_EXCLUDED_SELLER_USERNAMES, start=3):
+            row = self.car(listing_id)
+            row.update(seller_username=f"  {username.upper()}  ", mileage=2000 + listing_id)
+            rows.append(row)
+
+        first_allowed_id = len(rows) + 3
+        at_threshold = self.car(first_allowed_id)
+        at_threshold.update(seller_username="CIPAUTO", mileage=2700)
+        other_seller = self.car(first_allowed_id + 1)
+        other_seller.update(seller_username="Other seller", mileage=2699)
+        corrected = self.car(first_allowed_id + 2)
+        corrected.update(seller_username="AUTOPLAZA", mileage=200)
+        rows.extend((at_threshold, other_seller, corrected))
+
+        self.clean_detail_rows(rows)
+
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT id, mileage FROM listings_cleaned_temp ORDER BY id"
+            ).fetchall(),
+            [(first_allowed_id, 2700), (first_allowed_id + 1, 2699),
+             (first_allowed_id + 2, 200000)],
+        )
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM listings_temp").fetchone()[0], len(rows))
 
     def test_cleaner_handles_placeholder_identity_without_removing_real_models(self):
         changes = {
@@ -452,7 +517,8 @@ class DatabaseTests(unittest.TestCase):
             run.checkpoint_page(1, [1,3], finished=True)
             runtime.prepare_staging(run)
         with runtime.stage_session("details") as run:
-            self.assertEqual(run.pending_ids(), [])
+            self.assertEqual(run.pending_ids(), [1,3])
+            details.save_batch(run.connection, [self.car(1), self.car(3)], run)
             with run.connection.cursor() as cur:
                 run.finish(cur, "details")
             run.connection.commit()

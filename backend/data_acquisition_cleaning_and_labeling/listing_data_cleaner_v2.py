@@ -5,6 +5,55 @@ from pipeline_runtime import PipelineError, columns, names, run_cli, stage_sessi
 MDL_PER_EUR = 20.02
 USD_PER_EUR = 1.16
 
+EXCLUDED_SELLER_USERNAMES = (
+    "sauto-stock-extern",
+    "auto-store",
+    "4kautocenter",
+    "autooutlet",
+    "honestauto",
+    "eauto1",
+    "yarcars-import",
+    "autokorea-md",
+    "qcars",
+    "autoparc",
+    "rvm-auto",
+    "usauto",
+    "cristigocars",
+    "gocars",
+    "gicuwin77",
+    "panutaion18",
+    "odesa-md",
+    "gheorghe-1981",
+    "autobridge",
+)
+
+LOW_MILEAGE_EXCLUDED_SELLER_USERNAMES = (
+    "cipauto",
+    "cipauto2",
+    "premium-cipauto",
+    "autoplaza",
+    "autoplaza-botanica",
+)
+
+
+def exclude_seller_accounts(cur):
+    """Keep these accounts in raw/history, but omit their ads from analysis."""
+    cur.execute("""
+        DELETE FROM listings_cleaned_temp
+        WHERE LOWER(BTRIM(seller_username)) = ANY(%s)
+    """, (list(EXCLUDED_SELLER_USERNAMES),))
+    print(f"[CLEANER] EXCLUDED: {cur.rowcount:,} rows (blocked seller accounts)", flush=True)
+
+
+def exclude_low_mileage_seller_accounts(cur):
+    """Apply the account rule to the final, corrected mileage value."""
+    cur.execute("""
+        DELETE FROM listings_cleaned_temp
+        WHERE mileage < 2700
+          AND LOWER(BTRIM(seller_username)) = ANY(%s)
+    """, (list(LOW_MILEAGE_EXCLUDED_SELLER_USERNAMES),))
+    print(f"[CLEANER] EXCLUDED: {cur.rowcount:,} rows (selected sellers with mileage under 2,700 km)", flush=True)
+
 
 def normalize_vehicle_identity(cur):
     """Keep meaningful brand/model values and represent unspecified generations as NULL."""
@@ -123,6 +172,7 @@ def main():
             print(f"[CLEANER] EXCLUDED: {excluded_count:,} rows (initial filter: not Vând/Schimb, not Moldova-registered, state Nou, invalid/missing price)", flush=True)
             print(f"[CLEANER] AFTER:    {after_count:,} rows", flush=True)
 
+            exclude_seller_accounts(cur)
             normalize_vehicle_identity(cur)
 
             cur.execute("SELECT COUNT(*) FROM listings_cleaned_temp")
@@ -222,6 +272,8 @@ def main():
             after_count = cur.fetchone()[0]
             print(f"[CLEANER] EXCLUDED: {excluded_count:,} rows (negative mileage, mileage < 70, or mileage > 700,000)", flush=True)
             print(f"[CLEANER] AFTER:    {after_count:,} rows", flush=True)
+
+            exclude_low_mileage_seller_accounts(cur)
 
             cur.execute("SELECT COUNT(*) FROM listings_cleaned_temp")
             before_count = cur.fetchone()[0]
